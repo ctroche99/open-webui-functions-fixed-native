@@ -3730,20 +3730,16 @@ class Pipe:
                             if getattr(part, "thought", False) and getattr(
                                 part, "text", None
                             ):
+                                # Emit a single "Thinking…" status on the *first*
+                                # thought part so OWUI shows a spinner. This must
+                                # be checked BEFORE we set thinking_started_at,
+                                # otherwise the guard below is always False and the
+                                # spinner never fires. We do NOT include the actual
+                                # thought text here — doing so causes OWUI to render
+                                # its own collapsible thought block, duplicating the
+                                # <details type="reasoning"> block we emit at the end.
                                 if thinking_started_at is None:
                                     thinking_started_at = time.time()
-                                thought_chunks.append(part.text)
-                                # Preserve the raw Part (with thought_signature)
-                                # so it can be echoed back in history alongside
-                                # the function_call parts for Gemini 3 models.
-                                thought_parts_this_round.append(part)
-                                # Emit a single "Thinking…" status on first thought
-                                # so OWUI shows a spinner. We do NOT include the
-                                # actual thought text here — doing so causes OWUI
-                                # to render its own collapsible thought block,
-                                # duplicating the <details> block we emit at the
-                                # end of the full response.
-                                if thinking_started_at is None:
                                     await __event_emitter__(
                                         {
                                             "type": "status",
@@ -3755,6 +3751,11 @@ class Pipe:
                                             },
                                         }
                                     )
+                                thought_chunks.append(part.text)
+                                # Preserve the raw Part (with thought_signature)
+                                # so it can be echoed back in history alongside
+                                # the function_call parts for Gemini 3 models.
+                                thought_parts_this_round.append(part)
 
                             # Regular answer text
                             elif getattr(part, "text", None):
@@ -4086,8 +4087,13 @@ class Pipe:
                     quoted_lines.append(f"> {line}")
                 quoted_content = "\n".join(quoted_lines)
 
-                details_block = f"""<details>
-<summary>Thought ({duration_s}s)</summary>
+                # Use OWUI's native reasoning block (type="reasoning"). A plain
+                # <details> is not recognised by OWUI's renderer, so its inner
+                # blockquoted text leaks out as visible content and breaks the
+                # layout around adjacent tool-call blocks. The reasoning type is
+                # rendered as a proper collapsed "Thought for Ns" component.
+                details_block = f"""<details type="reasoning" done="true" duration="{duration_s}">
+<summary>Thought for {duration_s} seconds</summary>
 
 {quoted_content}
 
@@ -5017,7 +5023,11 @@ class Pipe:
                     # Combine all content
                     full_response = ""
 
-                    # If we have thoughts, wrap them using <details>
+                    # If we have thoughts, wrap them using OWUI's native
+                    # reasoning block. A plain <details> is not recognised by
+                    # OWUI's renderer, so its inner blockquoted text leaks out
+                    # as visible content; type="reasoning" renders a proper
+                    # collapsed "Thought for Ns" component instead.
                     if thought_segments:
                         duration_s = int(max(0, time.time() - start_ts))
                         # Format each line with > for blockquote while preserving formatting
@@ -5027,8 +5037,8 @@ class Pipe:
                             quoted_lines.append(f"> {line}")
                         quoted_content = "\n".join(quoted_lines)
 
-                        details_block = f"""<details>
-<summary>Thought ({duration_s}s)</summary>
+                        details_block = f"""<details type="reasoning" done="true" duration="{duration_s}">
+<summary>Thought for {duration_s} seconds</summary>
 
 {quoted_content}
 
