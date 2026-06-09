@@ -286,6 +286,14 @@ class Pipe:
             default=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             description="The Google Cloud region to use with Vertex AI.",
         )
+        GOOGLE_APPLICATION_CREDENTIALS: str = Field(
+            default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
+            description="Path to the Google Cloud service account credentials JSON file to use "
+            "with Vertex AI (sets the GOOGLE_APPLICATION_CREDENTIALS environment variable for "
+            "Application Default Credentials). This is the file location as seen inside the Open "
+            "WebUI container/host. Only used when USE_VERTEX_AI is true. Leave empty to rely on "
+            "ambient ADC (e.g. metadata server or an already-set environment variable).",
+        )
         VERTEX_AI_RAG_STORE: str | None = Field(
             default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
             description="Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/LOCATION/ragCorpora/DATA_STORE_ID). Only used when USE_VERTEX_AI is true.",
@@ -773,6 +781,13 @@ class Pipe:
         self._validate_api_key()
 
         if self.valves.USE_VERTEX_AI:
+            # If an explicit service account credentials file path is configured via
+            # the valve, expose it through GOOGLE_APPLICATION_CREDENTIALS so the genai
+            # SDK's Application Default Credentials lookup picks it up.
+            if self.valves.GOOGLE_APPLICATION_CREDENTIALS:
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+                    self.valves.GOOGLE_APPLICATION_CREDENTIALS
+                )
             self.log.debug(
                 f"Initializing Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})"
             )
@@ -840,6 +855,20 @@ class Pipe:
                 self.log.error("USE_VERTEX_AI is true, but VERTEX_PROJECT is not set.")
                 raise ValueError(
                     "VERTEX_PROJECT is not set. Please provide the Google Cloud project ID."
+                )
+            # If a service account credentials file path is configured, make sure it
+            # actually exists so misconfiguration surfaces with a clear error rather
+            # than an opaque authentication failure later on.
+            creds_path = self.valves.GOOGLE_APPLICATION_CREDENTIALS
+            if creds_path and not os.path.isfile(creds_path):
+                self.log.error(
+                    f"GOOGLE_APPLICATION_CREDENTIALS is set to '{creds_path}', but no file "
+                    "was found at that path."
+                )
+                raise ValueError(
+                    f"GOOGLE_APPLICATION_CREDENTIALS file not found at '{creds_path}'. "
+                    "Please provide a valid path to the service account JSON file as seen "
+                    "inside Open WebUI."
                 )
             # For Vertex AI, location has a default, so project is the main thing to check.
             # Actual authentication will be handled by ADC or environment.
