@@ -209,12 +209,15 @@ GOOGLE_CLOUD_PROJECT="your-gcp-project-id"
 # Defaults to "global" if not set.
 GOOGLE_CLOUD_LOCATION="your-gcp-location"
 
-# Optional: Path to a service account credentials JSON file to use for
-# authentication. This sets GOOGLE_APPLICATION_CREDENTIALS for Application
-# Default Credentials. The path is resolved as seen inside Open WebUI
-# (the container/host running OWUI). Can also be set in the admin valves
-# panel via the GOOGLE_APPLICATION_CREDENTIALS valve. Leave unset to rely
-# on ambient ADC (e.g. the GCE/GKE metadata server).
+# Optional: Service account credentials for authentication. In the admin
+# valves panel, the GOOGLE_APPLICATION_CREDENTIALS valve accepts EITHER the
+# full service account JSON key contents pasted directly (loaded in-memory,
+# nothing written to disk), OR a filesystem path to the JSON key file as seen
+# inside Open WebUI. As an environment variable it is the file path, which is
+# exported as GOOGLE_APPLICATION_CREDENTIALS for Application Default
+# Credentials. Leave unset to rely on ambient ADC (e.g. the GCE/GKE metadata
+# server). Pasting the JSON into the valve avoids file-mounting/persistence
+# issues and is the recommended approach for most deployments.
 GOOGLE_APPLICATION_CREDENTIALS="/path/inside/owui/to/service-account.json"
 
 # Vertex AI RAG Store path for grounding (e.g., projects/PROJECT/locations/global/collections/default_collection/dataStores/DATA_STORE_ID)

@@ -62,6 +62,7 @@ from PIL import Image
 from google import genai
 from google.genai import types
 from google.genai.errors import ClientError, ServerError, APIError
+from google.oauth2 import service_account
 from typing import List, Union, Optional, Dict, Any, Tuple, AsyncIterator, Callable
 from pydantic_core import core_schema
 from pydantic import BaseModel, Field, GetCoreSchemaHandler
@@ -286,13 +287,16 @@ class Pipe:
             default=os.getenv("GOOGLE_CLOUD_LOCATION", "global"),
             description="The Google Cloud region to use with Vertex AI.",
         )
-        GOOGLE_APPLICATION_CREDENTIALS: str = Field(
+        GOOGLE_APPLICATION_CREDENTIALS: EncryptedStr = Field(
             default=os.getenv("GOOGLE_APPLICATION_CREDENTIALS", ""),
-            description="Path to the Google Cloud service account credentials JSON file to use "
-            "with Vertex AI (sets the GOOGLE_APPLICATION_CREDENTIALS environment variable for "
-            "Application Default Credentials). This is the file location as seen inside the Open "
-            "WebUI container/host. Only used when USE_VERTEX_AI is true. Leave empty to rely on "
-            "ambient ADC (e.g. metadata server or an already-set environment variable).",
+            description="Google Cloud service account credentials for Vertex AI. You can either "
+            "paste the full service account JSON key contents directly here, OR provide a "
+            "filesystem path to the JSON key file as seen inside Open WebUI. When JSON is pasted "
+            "it is loaded in-memory (no file needed); when a path is given it sets the "
+            "GOOGLE_APPLICATION_CREDENTIALS environment variable for Application Default "
+            "Credentials. Only used when USE_VERTEX_AI is true. Leave empty to rely on ambient "
+            "ADC (e.g. the GCE/GKE metadata server).",
+            json_schema_extra={"input": {"type": "password"}},
         )
         VERTEX_AI_RAG_STORE: str | None = Field(
             default=os.getenv("GOOGLE_VERTEX_AI_RAG_STORE"),
@@ -781,13 +785,11 @@ class Pipe:
         self._validate_api_key()
 
         if self.valves.USE_VERTEX_AI:
-            # If an explicit service account credentials file path is configured via
-            # the valve, expose it through GOOGLE_APPLICATION_CREDENTIALS so the genai
-            # SDK's Application Default Credentials lookup picks it up.
-            if self.valves.GOOGLE_APPLICATION_CREDENTIALS:
-                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
-                    self.valves.GOOGLE_APPLICATION_CREDENTIALS
-                )
+            # Resolve the optional service account credentials configured via the valve.
+            # Pasted JSON is loaded into an in-memory credentials object; a filesystem
+            # path is exposed through GOOGLE_APPLICATION_CREDENTIALS so the genai SDK's
+            # Application Default Credentials lookup picks it up.
+            credentials = self._resolve_vertex_credentials()
             self.log.debug(
                 f"Initializing Vertex AI client (Project: {self.valves.VERTEX_PROJECT}, Location: {self.valves.VERTEX_LOCATION})"
             )
@@ -795,6 +797,7 @@ class Pipe:
                 vertexai=True,
                 project=self.valves.VERTEX_PROJECT,
                 location=self.valves.VERTEX_LOCATION,
+                credentials=credentials,
             )
         else:
             self.log.debug("Initializing Google Generative AI client with API Key")
@@ -843,6 +846,40 @@ class Pipe:
                 http_options=options,
             )
 
+    # Scope required for Vertex AI when building credentials from a service account.
+    _VERTEX_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+
+    def _resolve_vertex_credentials(self):
+        """
+        Resolve the optional service account credentials configured in the
+        GOOGLE_APPLICATION_CREDENTIALS valve.
+
+        The valve accepts either:
+          * the full service account JSON key contents pasted directly, or
+          * a filesystem path to the JSON key file (as seen inside Open WebUI).
+
+        Returns:
+            A google.oauth2.service_account.Credentials object when JSON was
+            pasted, or None when a path (or nothing) was provided. When a path
+            is provided it is exported via the GOOGLE_APPLICATION_CREDENTIALS
+            environment variable so the SDK's ADC lookup uses it.
+        """
+        raw = EncryptedStr.decrypt(self.valves.GOOGLE_APPLICATION_CREDENTIALS)
+        if not raw:
+            return None
+
+        stripped = raw.strip()
+        # Treat values that look like a JSON object as inline credentials.
+        if stripped.startswith("{"):
+            info = json.loads(stripped)
+            return service_account.Credentials.from_service_account_info(
+                info, scopes=self._VERTEX_SCOPES
+            )
+
+        # Otherwise treat the value as a path to the credentials file.
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = stripped
+        return None
+
     def _validate_api_key(self) -> None:
         """
         Validates that the necessary Google API credentials are set.
@@ -856,20 +893,37 @@ class Pipe:
                 raise ValueError(
                     "VERTEX_PROJECT is not set. Please provide the Google Cloud project ID."
                 )
-            # If a service account credentials file path is configured, make sure it
-            # actually exists so misconfiguration surfaces with a clear error rather
-            # than an opaque authentication failure later on.
-            creds_path = self.valves.GOOGLE_APPLICATION_CREDENTIALS
-            if creds_path and not os.path.isfile(creds_path):
-                self.log.error(
-                    f"GOOGLE_APPLICATION_CREDENTIALS is set to '{creds_path}', but no file "
-                    "was found at that path."
-                )
-                raise ValueError(
-                    f"GOOGLE_APPLICATION_CREDENTIALS file not found at '{creds_path}'. "
-                    "Please provide a valid path to the service account JSON file as seen "
-                    "inside Open WebUI."
-                )
+            # If service account credentials are configured via the valve, validate
+            # them up front so misconfiguration surfaces with a clear error rather
+            # than an opaque authentication failure later on. The valve accepts
+            # either pasted JSON contents or a filesystem path.
+            creds = EncryptedStr.decrypt(
+                self.valves.GOOGLE_APPLICATION_CREDENTIALS
+            ).strip()
+            if creds:
+                if creds.startswith("{"):
+                    try:
+                        json.loads(creds)
+                    except json.JSONDecodeError as e:
+                        self.log.error(
+                            f"GOOGLE_APPLICATION_CREDENTIALS contains invalid JSON: {e}"
+                        )
+                        raise ValueError(
+                            "GOOGLE_APPLICATION_CREDENTIALS looks like JSON but could not "
+                            f"be parsed: {e}. Please paste the complete service account "
+                            "JSON key contents."
+                        )
+                elif not os.path.isfile(creds):
+                    self.log.error(
+                        f"GOOGLE_APPLICATION_CREDENTIALS is set to '{creds}', but no file "
+                        "was found at that path."
+                    )
+                    raise ValueError(
+                        f"GOOGLE_APPLICATION_CREDENTIALS file not found at '{creds}'. "
+                        "Either paste the service account JSON contents directly, or "
+                        "provide a valid path to the JSON key file as seen inside Open "
+                        "WebUI."
+                    )
             # For Vertex AI, location has a default, so project is the main thing to check.
             # Actual authentication will be handled by ADC or environment.
             self.log.debug(
