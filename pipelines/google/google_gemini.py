@@ -1342,6 +1342,39 @@ class Pipe:
         return tool_name in {"generate_image", "edit_image"}
 
     @staticmethod
+    def _build_owui_tool_call_block(
+        tool_name: str, tool_args: Dict[str, Any], tool_result: Any
+    ) -> str:
+        """Build a single OWUI-native ``<details type="tool_calls">`` block.
+
+        OWUI's frontend renders ``type="tool_calls"`` details from HTML
+        attributes (``name``/``arguments``/``result``), not the markdown body —
+        it JSON.parses ``arguments`` and ``result`` and ignores the body
+        entirely. Emitting markdown inside the block (as an earlier version did)
+        leaves those attributes empty, so the summary shows a blank name and the
+        dropdown is empty. We mirror OWUI's own serialization here: one block per
+        call, with args/result JSON-encoded and HTML-escaped so the attributes
+        survive the markup.
+        """
+        import html as _html
+
+        args_json = _html.escape(
+            json.dumps(tool_args or {}, ensure_ascii=False, default=str)
+        )
+        result_json = _html.escape(
+            json.dumps(tool_result, ensure_ascii=False, default=str)
+        )
+        return (
+            f'<details type="tool_calls" done="true" '
+            f'id="{uuid.uuid4().hex[:8]}" '
+            f'name="{_html.escape(str(tool_name))}" '
+            f'arguments="{args_json}" '
+            f'result="{result_json}">\n'
+            f"<summary>Tool Executed</summary>\n"
+            f"</details>"
+        )
+
+    @staticmethod
     def _owui_callable_to_gemini_tool(name: str, fn: Any) -> Optional["types.Tool"]:
         """Convert an OWUI tool callable to a Gemini types.Tool with a clean FunctionDeclaration.
 
@@ -4059,9 +4092,10 @@ class Pipe:
                             )
                         )
                     )
-                    args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
                     tool_call_details.append(
-                        f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
+                        self._build_owui_tool_call_block(
+                            tool_name, tool_args, tool_result
+                        )
                     )
 
                 # If all tool calls failed (not found / errored), function_response_parts
@@ -4084,11 +4118,9 @@ class Pipe:
                 # what tools ran — matching the shape OWUI itself emits for native calls.
                 # Kept separate from answer_chunks so grounding only processes real text.
                 if tool_call_details:
-                    tool_calls_block = (
-                        '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
-                        + "\n\n".join(tool_call_details)
-                        + "\n\n</details>"
-                    )
+                    # One OWUI-native <details> block per call, matching how OWUI
+                    # renders its own native tool calls (each call gets its own row).
+                    tool_calls_block = "\n\n".join(tool_call_details)
                     tool_call_blocks.append(tool_calls_block)
                     await emit_chat_event(
                         "chat:message:delta",
@@ -5040,9 +5072,10 @@ class Pipe:
                                     )
                                 )
                             )
-                            args_repr = ", ".join(f"{k}={v!r}" for k, v in tool_args.items())
                             tool_call_details.append(
-                                f"**{tool_name}**({args_repr})\n```\n{tool_result}\n```"
+                                self._build_owui_tool_call_block(
+                                    tool_name, tool_args, tool_result
+                                )
                             )
 
                         # Don't push empty Content to Gemini — would cause an API error
@@ -5065,11 +5098,9 @@ class Pipe:
                         # Accumulate <details type="tool_calls"> separately from answer text
                         # so grounding citation processing only sees real model text.
                         if tool_call_details:
-                            tool_calls_block = (
-                                '<details type="tool_calls">\n<summary>Tool Calls</summary>\n\n'
-                                + "\n\n".join(tool_call_details)
-                                + "\n\n</details>"
-                            )
+                            # One OWUI-native <details> block per call (see
+                            # _build_owui_tool_call_block).
+                            tool_calls_block = "\n\n".join(tool_call_details)
                             tool_call_blocks_ns.append(tool_calls_block)
 
                         # Extend conversation with tool calls and their responses.
