@@ -1347,21 +1347,22 @@ class Pipe:
     ) -> str:
         """Build a single OWUI-native ``<details type="tool_calls">`` block.
 
-        OWUI's frontend renders ``type="tool_calls"`` details from HTML
-        attributes (``name``/``arguments``/``result``), not the markdown body —
-        it JSON.parses ``arguments`` and ``result`` and ignores the body
-        entirely. Emitting markdown inside the block (as an earlier version did)
-        leaves those attributes empty, so the summary shows a blank name and the
-        dropdown is empty. We mirror OWUI's own serialization here: one block per
-        call, with args/result JSON-encoded and HTML-escaped so the attributes
-        survive the markup.
+        OWUI's frontend renders ``type="tool_calls"`` details from the ``name``
+        and ``arguments`` HTML attributes plus the *body* of the block (the
+        result), not from a ``result`` attribute. It JSON.parses ``arguments``
+        and the body text. An earlier version put everything in the markdown
+        body, leaving those attributes empty — so the summary showed a blank
+        name and the dropdown was empty. We mirror OWUI's own serialization
+        (see ``serialize_output`` in OWUI's ``utils/middleware.py``): one block
+        per call, args as an escaped-JSON attribute, result as escaped JSON in
+        the body.
         """
         import html as _html
 
         args_json = _html.escape(
             json.dumps(tool_args or {}, ensure_ascii=False, default=str)
         )
-        result_json = _html.escape(
+        result_body = _html.escape(
             json.dumps(tool_result, ensure_ascii=False, default=str)
         )
         return (
@@ -1369,8 +1370,9 @@ class Pipe:
             f'id="{uuid.uuid4().hex[:8]}" '
             f'name="{_html.escape(str(tool_name))}" '
             f'arguments="{args_json}" '
-            f'result="{result_json}">\n'
+            f'embeds="[]">\n'
             f"<summary>Tool Executed</summary>\n"
+            f"{result_body}\n"
             f"</details>"
         )
 
