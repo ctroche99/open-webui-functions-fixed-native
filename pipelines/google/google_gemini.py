@@ -4,7 +4,7 @@ author: owndev, olivier-lacroix
 author_url: https://github.com/owndev/
 project_url: https://github.com/owndev/Open-WebUI-Functions
 funding_url: https://github.com/sponsors/owndev
-version: 1.15.2
+version: 1.15.3
 required_open_webui_version: 0.9.0
 license: Apache License 2.0
 description: Highly optimized Google Gemini pipeline with advanced image and video generation capabilities, intelligent compression, and streamlined processing workflows.
@@ -123,6 +123,12 @@ VIDEO_PERSON_GENERATION_OPTIONS: List[str] = [
     "allow_adult",
     "dont_allow",
 ]
+
+# Tool types that OWUI treats as "external" — their callables return a
+# (result, headers) tuple instead of a bare result. Mirrors
+# open_webui.utils.middleware.EXTERNAL_TOOL_TYPES. Open Terminal registers
+# its tools as one of these types.
+EXTERNAL_TOOL_TYPES = ("external", "action", "terminal")
 
 
 # Simplified encryption implementation with automatic handling
@@ -1519,6 +1525,7 @@ class Pipe:
         self,
         tool_result: Any,
         event_emitter: Optional[Callable] = None,
+        tool_type: Optional[str] = None,
     ) -> str:
         """Mirror OWUI middleware's tool-result handling for direct-call pipes.
 
@@ -1529,6 +1536,13 @@ class Pipe:
         does that work locally: it detects HTMLResponse / image-data /
         dict / list returns, emits the matching persisted events, and returns
         the string the LLM should see.
+
+        ``tool_type`` is the OWUI tool type (e.g. "external"/"terminal"). For
+        external tools — like Open Terminal — the callable returns a
+        ``(result, headers)`` tuple rather than a bare result, so the headers
+        must be unwrapped (and any inline HTML / Location embed honoured)
+        before the result is serialised for the LLM. Without this the headers
+        leak into the LLM-visible text and any iframe embed is dropped.
         """
         try:
             from fastapi.responses import HTMLResponse  # noqa: WPS433
@@ -1540,51 +1554,111 @@ class Pipe:
         llm_text: Optional[str] = None
         generic_embed_msg = "Embedded UI result is active and visible to the user."
 
-        # (HTMLResponse, context) tuple — OWUI's canonical rich-card pattern
+        # External tool (result, headers) tuple — OWUI's pattern for
+        # OpenAPI/MCP/terminal tool servers (Open Terminal et al.). Unwrap the
+        # headers, honour an inline HTML / Location embed, and reduce
+        # tool_result down to the actual payload so the chain below serialises
+        # only the payload (never the headers) for the LLM.
         if (
-            HTMLResponse is not None
-            and isinstance(tool_result, tuple)
+            tool_type in EXTERNAL_TOOL_TYPES
+            and isinstance(tool_result, (tuple, list))
             and len(tool_result) == 2
-            and isinstance(tool_result[0], HTMLResponse)
         ):
-            html_response, context = tool_result
-            if "inline" in html_response.headers.get("content-disposition", ""):
-                embeds.append(html_response.body.decode("utf-8", "replace"))
-            if context is None:
-                llm_text = generic_embed_msg
-            elif isinstance(context, (dict, list)):
-                llm_text = json.dumps(context, ensure_ascii=False)
-            else:
-                llm_text = str(context)
+            tool_result, tool_response_headers = tool_result
+            try:
+                if not isinstance(tool_response_headers, dict):
+                    tool_response_headers = dict(tool_response_headers)
+            except Exception:
+                tool_response_headers = {}
 
-        # Bare HTMLResponse — render embed, hand the LLM a generic ack
-        elif HTMLResponse is not None and isinstance(tool_result, HTMLResponse):
-            if "inline" in tool_result.headers.get("content-disposition", ""):
-                embeds.append(tool_result.body.decode("utf-8", "replace"))
-            llm_text = generic_embed_msg
-
-        # Base64 image data URL — files event
-        elif isinstance(tool_result, str) and tool_result.startswith("data:image/"):
-            files.append({"type": "image", "url": tool_result})
-            llm_text = "Image rendered for the user."
-
-        # Generic tuple without HTMLResponse — keep the first str if any
-        elif isinstance(tool_result, tuple):
-            llm_text = next(
-                (v for v in tool_result if isinstance(v, str)), None
-            )
-            if llm_text is None:
-                llm_text = json.dumps(
-                    list(tool_result), ensure_ascii=False, default=str
+            if isinstance(tool_response_headers, dict) and tool_response_headers:
+                content_disposition = tool_response_headers.get(
+                    "Content-Disposition",
+                    tool_response_headers.get("content-disposition", ""),
                 )
+                if "inline" in content_disposition:
+                    content_type = tool_response_headers.get(
+                        "Content-Type",
+                        tool_response_headers.get("content-type", ""),
+                    )
+                    location = tool_response_headers.get(
+                        "Location",
+                        tool_response_headers.get("location", ""),
+                    )
+                    result_context = None
+                    if "text/html" in content_type:
+                        html_content = tool_result
+                        if (
+                            isinstance(tool_result, (tuple, list))
+                            and len(tool_result) == 2
+                        ):
+                            html_content, result_context = tool_result
+                        embeds.append(html_content)
+                    elif location:
+                        if (
+                            isinstance(tool_result, (tuple, list))
+                            and len(tool_result) == 2
+                        ):
+                            _, result_context = tool_result
+                        embeds.append(location)
+                    if embeds:
+                        if isinstance(result_context, (str, dict, list)):
+                            llm_text = (
+                                result_context
+                                if isinstance(result_context, str)
+                                else json.dumps(result_context, ensure_ascii=False)
+                            )
+                        else:
+                            llm_text = generic_embed_msg
 
-        # Dict/list — JSON-serialise for the LLM
-        elif isinstance(tool_result, (dict, list)):
-            llm_text = json.dumps(tool_result, ensure_ascii=False)
+        # If the external-tool branch above already produced an embed/text,
+        # skip the generic classification so it can't clobber that result.
+        if llm_text is None and not embeds:
+            # (HTMLResponse, context) tuple — OWUI's canonical rich-card pattern
+            if (
+                HTMLResponse is not None
+                and isinstance(tool_result, tuple)
+                and len(tool_result) == 2
+                and isinstance(tool_result[0], HTMLResponse)
+            ):
+                html_response, context = tool_result
+                if "inline" in html_response.headers.get("content-disposition", ""):
+                    embeds.append(html_response.body.decode("utf-8", "replace"))
+                if context is None:
+                    llm_text = generic_embed_msg
+                elif isinstance(context, (dict, list)):
+                    llm_text = json.dumps(context, ensure_ascii=False)
+                else:
+                    llm_text = str(context)
 
-        # Plain str / None / other — coerce
-        else:
-            llm_text = "" if tool_result is None else str(tool_result)
+            # Bare HTMLResponse — render embed, hand the LLM a generic ack
+            elif HTMLResponse is not None and isinstance(tool_result, HTMLResponse):
+                if "inline" in tool_result.headers.get("content-disposition", ""):
+                    embeds.append(tool_result.body.decode("utf-8", "replace"))
+                llm_text = generic_embed_msg
+
+            # Base64 image data URL — files event
+            elif isinstance(tool_result, str) and tool_result.startswith("data:image/"):
+                files.append({"type": "image", "url": tool_result})
+                llm_text = "Image rendered for the user."
+
+            # Generic tuple without HTMLResponse — keep the first str if any
+            elif isinstance(tool_result, tuple):
+                llm_text = next(
+                    (v for v in tool_result if isinstance(v, str)), None
+                )
+                if llm_text is None:
+                    llm_text = json.dumps(
+                        list(tool_result), ensure_ascii=False, default=str
+                    )
+
+            # Dict/list — JSON-serialise for the LLM
+            elif isinstance(tool_result, (dict, list)):
+                llm_text = json.dumps(tool_result, ensure_ascii=False)
+
+            # Plain str / None / other — coerce
+            else:
+                llm_text = "" if tool_result is None else str(tool_result)
 
         if event_emitter is not None and embeds:
             try:
@@ -1602,6 +1676,60 @@ class Pipe:
                 self.log.warning(f"Failed to emit 'files' event: {e}")
 
         return llm_text or ""
+
+    async def _emit_terminal_event(
+        self,
+        tool_name: str,
+        tool_params: dict,
+        tool_result: Any,
+        event_emitter: Optional[Callable] = None,
+    ) -> None:
+        """Emit Open Terminal's `terminal:*` events for direct-call pipes.
+
+        Open Terminal's file tools rely on a side-channel event — not the
+        textual tool result — to drive the chat UI: `display_file` opens the
+        inline file preview, `write_file` / `replace_file_content` refresh the
+        file view, and `run_command` refreshes the terminal pane. OWUI fires
+        these from `terminal_event_handler` inside its middleware, which this
+        pipe bypasses while running its own native tool loop. Without this
+        helper the tools execute but nothing renders (e.g. `display_file`
+        appears to "do nothing"). Mirrors
+        open_webui.utils.middleware.terminal_event_handler.
+        """
+        if not event_emitter:
+            return
+
+        if tool_name == "display_file":
+            path = (tool_params or {}).get("path", "")
+            if not path:
+                return
+            # Only open the preview if the file actually exists. The result may
+            # arrive as a JSON string (already serialised for the LLM) or a dict.
+            parsed = tool_result
+            if isinstance(parsed, str):
+                try:
+                    parsed = json.loads(parsed)
+                except (json.JSONDecodeError, TypeError, ValueError):
+                    pass
+            if isinstance(parsed, dict) and parsed.get("exists") is False:
+                return
+            event = {"type": "terminal:display_file", "data": {"path": path}}
+        elif tool_name in ("write_file", "replace_file_content"):
+            path = (tool_params or {}).get("path", "")
+            if not path:
+                return
+            event = {"type": f"terminal:{tool_name}", "data": {"path": path}}
+        elif tool_name == "run_command":
+            event = {"type": "terminal:run_command", "data": {}}
+        else:
+            return
+
+        try:
+            await event_emitter(event)
+        except Exception as e:  # pragma: no cover - defensive
+            self.log.warning(
+                f"Failed to emit '{event['type']}' event: {e}"
+            )
 
     @staticmethod
     def _image_data_hash(image_data: Any) -> str:
@@ -4063,8 +4191,18 @@ class Pipe:
                             # and hand back the LLM-visible text. Without this
                             # the pipe's bypass of OWUI middleware would drop
                             # the embed on the floor.
+                            _tool_type = __tools__[tool_name].get("type")
                             tool_result = await self._process_tool_result_for_owui(
-                                tool_result, __event_emitter__
+                                tool_result, __event_emitter__, tool_type=_tool_type
+                            )
+                            # Mirror OWUI's terminal_event_handler: fire the
+                            # 'terminal:*' side-channel events that Open Terminal
+                            # relies on to render file previews / refresh views
+                            # (display_file, write_file, replace_file_content,
+                            # run_command). Without this the tool runs but the UI
+                            # never updates.
+                            await self._emit_terminal_event(
+                                tool_name, tool_args, tool_result, __event_emitter__
                             )
                             self.log.info(
                                 f"[stream] tool {tool_name!r} returned {len(tool_result)} chars: "
@@ -5045,8 +5183,16 @@ class Pipe:
                                         # and other wrappers that fool iscoroutinefunction.
                                         _raw = tool_callable(**tool_args)
                                         tool_result = (await _raw) if inspect.isawaitable(_raw) else _raw
+                                    _tool_type = __tools__[tool_name].get("type")
                                     tool_result = await self._process_tool_result_for_owui(
-                                        tool_result, __event_emitter__
+                                        tool_result, __event_emitter__, tool_type=_tool_type
+                                    )
+                                    # Mirror OWUI's terminal_event_handler so Open
+                                    # Terminal's display_file / write_file /
+                                    # replace_file_content / run_command tools update
+                                    # the UI (file preview, view refresh).
+                                    await self._emit_terminal_event(
+                                        tool_name, tool_args, tool_result, __event_emitter__
                                     )
                                     self.log.info(
                                         f"[non-stream] tool {tool_name!r} returned {len(tool_result)} chars: "
