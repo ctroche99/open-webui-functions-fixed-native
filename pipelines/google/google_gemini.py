@@ -3244,17 +3244,33 @@ class Pipe:
 
         # Add status specifying google queries used for grounding
         if web_search_queries:
+            # Build titled "items" from the grounding chunks so OWUI's
+            # WebSearchResults widget renders favicon + title source cards
+            # (it prefers `items` over bare `urls`). Fall back to the Google
+            # query links when no web chunks are present (e.g. Vertex AI Search).
+            items = [
+                {
+                    "link": chunk.web.uri,
+                    "title": (chunk.web.title or chunk.web.uri),
+                }
+                for chunk in grounding_chunks
+                if getattr(chunk, "web", None) and chunk.web and chunk.web.uri
+            ]
+            query_urls = [
+                f"https://www.google.com/search?q={query}"
+                for query in web_search_queries
+            ]
+            status_data = {
+                "action": "web_search",
+                "description": "This response was grounded with Google Search",
+                "urls": [item["link"] for item in items] or query_urls,
+            }
+            if items:
+                status_data["items"] = items
             await __event_emitter__(
                 {
                     "type": "status",
-                    "data": {
-                        "action": "web_search",
-                        "description": "This response was grounded with Google Search",
-                        "urls": [
-                            f"https://www.google.com/search?q={query}"
-                            for query in web_search_queries
-                        ],
-                    },
+                    "data": status_data,
                 }
             )
 
@@ -3599,10 +3615,14 @@ class Pipe:
                     raw_bytes = await resp.read()
                     content_type = resp.headers.get("Content-Type", "")
 
+            page_title = url
             if "text/html" in content_type or not content_type:
                 encoding = resp.charset or "utf-8"
                 html = raw_bytes.decode(encoding, errors="replace")
                 soup = BeautifulSoup(html, "html.parser")
+                # Capture the page <title> for the source card / citation label.
+                if soup.title and soup.title.string:
+                    page_title = soup.title.string.strip() or url
                 # Remove script, style, nav, footer — keep readable body text
                 for tag in soup(["script", "style", "nav", "footer", "header", "noscript"]):
                     tag.decompose()
@@ -3634,7 +3654,32 @@ class Pipe:
             )
 
             if __event_emitter__:
+                # Emit the fetched page as a persisted citation source so OWUI
+                # renders a numbered citation chip + source panel for it, with the
+                # actual page text available in the hover preview. This mirrors
+                # OWUI's native fetch_url, which registers the page as a source.
                 try:
+                    await __event_emitter__(
+                        {
+                            "type": "source",
+                            "data": {
+                                "source": {
+                                    "name": page_title,
+                                    "type": "web_search_results",
+                                    "url": url,
+                                },
+                                "document": [text[:500]],
+                                "metadata": [
+                                    {"source": url, "name": page_title, "url": url}
+                                ],
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
+                try:
+                    # Titled `items` so the WebSearchResults widget renders a
+                    # favicon + title card for the fetched page.
                     await __event_emitter__(
                         {
                             "type": "status",
@@ -3642,6 +3687,8 @@ class Pipe:
                                 "action": "web_search",
                                 "description": f"Fetched {len(text):,} chars from {url}",
                                 "done": True,
+                                "urls": [url],
+                                "items": [{"link": url, "title": page_title}],
                             },
                         }
                     )
@@ -3683,12 +3730,15 @@ class Pipe:
         self.log.info(f"[search] intercepting search_web — querying Google: {query!r}")
         if __event_emitter__:
             try:
+                # Emit the same "queries generated" event OWUI's native web search
+                # uses so the frontend renders the "Searching → [query chip]" UI
+                # rather than a plain spinner line.
                 await __event_emitter__(
                     {
                         "type": "status",
                         "data": {
-                            "action": "web_search",
-                            "description": f"Searching Google for: {query}",
+                            "action": "web_search_queries_generated",
+                            "queries": [query],
                             "done": False,
                         },
                     }
@@ -3800,17 +3850,32 @@ class Pipe:
 
             if __event_emitter__:
                 try:
+                    # Build titled "items" so OWUI's WebSearchResults widget renders
+                    # favicon + title cards (it prefers `items` over bare `urls`).
+                    # Falls back to a Google query link when no chunks were returned.
+                    result_urls = [r["url"] for r in source_chunks if r["url"]]
+                    items = [
+                        {"link": r["url"], "title": r["title"] or r["url"]}
+                        for r in source_chunks
+                        if r["url"]
+                    ]
+                    status_data = {
+                        "action": "web_search",
+                        # OWUI canonical i18n key — interpolated client-side
+                        # with `count` for a localized "Searched N sites".
+                        "description": "Searched {{count}} sites",
+                        "done": True,
+                        "urls": result_urls
+                        or [f"https://www.google.com/search?q={query}"],
+                    }
+                    # Only attach `items` when non-empty: an empty array is truthy
+                    # in JS and would suppress the `urls` fallback in the widget.
+                    if items:
+                        status_data["items"] = items
                     await __event_emitter__(
                         {
                             "type": "status",
-                            "data": {
-                                "action": "web_search",
-                                "description": f"Found {len(source_chunks)} results for: {query}",
-                                "done": True,
-                                "urls": [
-                                    r["url"] for r in source_chunks if r["url"]
-                                ] or [f"https://www.google.com/search?q={query}"],
-                            },
+                            "data": status_data,
                         }
                     )
                 except Exception:
@@ -3819,6 +3884,21 @@ class Pipe:
             return json.dumps(results, ensure_ascii=False)
         except Exception as e:
             self.log.warning(f"[search] Google search failed for {query!r}: {e}")
+            if __event_emitter__:
+                try:
+                    await __event_emitter__(
+                        {
+                            "type": "status",
+                            "data": {
+                                "action": "web_search",
+                                "description": f"Search failed for: {query}",
+                                "done": True,
+                                "error": True,
+                            },
+                        }
+                    )
+                except Exception:
+                    pass
             return json.dumps([])
 
     async def _handle_streaming_response(
