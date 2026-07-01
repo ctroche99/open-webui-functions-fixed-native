@@ -774,7 +774,9 @@ class Pipe:
     def __init__(self):
         """Initializes the Pipe instance and configures the genai library."""
         self.valves = self.Valves()
-        self.name: str = "Google Gemini: "
+        # Empty prefix so the UI shows only the clean, formatted model name
+        # (e.g. "Gemini 3.1 Pro Preview") instead of "Google Gemini: <id>".
+        self.name: str = ""
 
         # Setup logging
         self.log = logging.getLogger("google_ai.pipe")
@@ -954,6 +956,34 @@ class Pipe:
         stripped = re.sub(r"^(?:.*/|[^.]*\.)", "", model_name)
         return stripped
 
+    def _format_model_name(self, model_id: str) -> str:
+        """
+        Turn a raw model id into a clean, human-friendly display name.
+
+        e.g. "gemini-3.1-pro-preview" -> "Gemini 3.1 Pro Preview"
+        e.g. "gemini-3.5-flash"       -> "Gemini 3.5 Flash"
+        e.g. "veo-3.1-generate"       -> "Veo 3.1 Generate"
+
+        Hyphens become spaces, version/number tokens (e.g. "2.5", "001") are
+        kept as-is, known acronyms are uppercased, and every other word is
+        capitalized.
+        """
+        # Words that read better fully uppercased than title-cased.
+        acronyms = {"tts", "ai", "hd", "sd", "4k", "2k", "1k", "8b"}
+        words: List[str] = []
+        for token in model_id.split("-"):
+            if not token:
+                continue
+            lower = token.lower()
+            if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", token):
+                # Pure version / number token (e.g. "3.1", "2.5", "001").
+                words.append(token)
+            elif lower in acronyms:
+                words.append(token.upper())
+            else:
+                words.append(token.capitalize())
+        return " ".join(words) if words else model_id
+
     def get_google_models(self, force_refresh: bool = False) -> List[Dict[str, str]]:
         """
         Retrieve available Google models suitable for content generation.
@@ -1001,7 +1031,7 @@ class Pipe:
                 ) or model_id_stripped.startswith("veo-")
                 if is_content_model or is_video_model:
                     model_id = model_id_stripped
-                    model_name = model.display_name or model_id
+                    model_name = self._format_model_name(model_id)
 
                     # Check if model supports image generation
                     supports_image_generation = self._check_image_generation_support(
@@ -2029,7 +2059,7 @@ class Pipe:
             List of dictionaries containing model id and name.
         """
         try:
-            self.name = "Google Gemini: "
+            self.name = ""
             return self.get_google_models()
         except ValueError as e:
             # Handle the case where API key is missing during pipe listing
